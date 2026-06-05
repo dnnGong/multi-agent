@@ -5,10 +5,21 @@ import os
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 from openai import OpenAI
-from pinecone import Pinecone
+
+try:
+    from pinecone import Pinecone
+except Exception:  # Pinecone is optional when using the local RAG store.
+    Pinecone = None  # type: ignore
+
+try:
+    from rag import DEFAULT_STORE_PATH, LocalVectorStore
+except Exception:
+    DEFAULT_STORE_PATH = Path(__file__).resolve().parents[1] / "data" / "machine_learning_vector_store.json"
+    LocalVectorStore = None  # type: ignore
 
 
 # =========================
@@ -153,11 +164,20 @@ class Query_Agent:
     - Returns docs
     """
 
-    def __init__(self, pinecone_index, openai_client: OpenAI, embeddings_model: str, namespace: str = "") -> None:
+    def __init__(
+        self,
+        pinecone_index,
+        openai_client: OpenAI,
+        embeddings_model: str,
+        namespace: str = "",
+        local_store: Optional[Any] = None,
+    ) -> None:
         self.index = pinecone_index
         self.client = openai_client
         self.embeddings_model = embeddings_model
         self.namespace = (namespace or "").strip()
+        self.local_store = local_store
+        self.last_docs: List[RetrievedDoc] = []
         self._cached_namespaces: Optional[List[str]] = None
         self._fallback_namespace_guesses = [
             "",
@@ -233,6 +253,20 @@ class Query_Agent:
         return out
 
     def query_vector_store(self, query: str, k: int = 5) -> List[RetrievedDoc]:
+        if self.local_store is not None:
+            docs = [
+                RetrievedDoc(id=d.id, score=d.score, text=d.text, meta=d.meta)
+                for d in self.local_store.search(self.client, query, k=k)
+            ]
+            self.last_docs = docs
+            print(f"[DEBUG][LocalRAG] k={k} got={len(docs)} top_scores={[d.score for d in docs[:3]]}")
+            return docs
+
+        if self.index is None:
+            raise RuntimeError(
+                "No vector store configured. Build the local RAG store first or set Pinecone credentials."
+            )
+
         vec = self._embed(query)
         for ns in self._candidate_namespaces():
             docs = self._query_one_namespace(vec, k, ns)
@@ -242,7 +276,9 @@ class Query_Agent:
                         f"[DEBUG][Pinecone] using fallback namespace: "
                         f"{ns or '<default>'}"
                     )
+                self.last_docs = docs
                 return docs
+        self.last_docs = []
         return []
 
     def extract_action(self, response, query=None):
@@ -352,16 +388,47 @@ class Relevant_Documents_Agent:
 # =========================
 
 class Head_Agent:
-    def __init__(self, openai_key: str, pinecone_key: str, pinecone_index_name: str, pinecone_namespace: str = "ns-2500") -> None:
+    def __init__(
+        self,
+        openai_key: str,
+        pinecone_key: str = "",
+        pinecone_index_name: str = "",
+        pinecone_namespace: str = "ns-2500",
+        vector_store_path: str = "",
+        use_local_rag: Optional[bool] = None,
+        retrieval_k: int = 5,
+    ) -> None:
         self.openai_key = openai_key
-        self.pinecone_key = pinecone_key
-        self.pinecone_index_name = pinecone_index_name
+        self.pinecone_key = pinecone_key or ""
+        self.pinecone_index_name = pinecone_index_name or ""
         self.pinecone_namespace = (pinecone_namespace or "").strip()
+        self.vector_store_path = vector_store_path or str(DEFAULT_STORE_PATH)
+        store_path = Path(self.vector_store_path)
+        self.use_local_rag = store_path.exists() if use_local_rag is None else use_local_rag
+        self.retrieval_k = retrieval_k
+        self.last_docs: List[RetrievedDoc] = []
 
         self.client = OpenAI(api_key=self.openai_key)
 
-        pc = Pinecone(api_key=self.pinecone_key)
-        self.index = pc.Index(self.pinecone_index_name)
+        self.local_store = None
+        self.index = None
+        if self.use_local_rag:
+            if LocalVectorStore is None:
+                raise RuntimeError("Local RAG module is not available.")
+            if store_path.exists():
+                self.local_store = LocalVectorStore(store_path).load()
+            else:
+                raise FileNotFoundError(
+                    f"Local vector store not found: {store_path}. "
+                    "Run `python src/rag.py` first or switch to Pinecone."
+                )
+        else:
+            if Pinecone is None:
+                raise RuntimeError("Pinecone package is not installed. Install `pinecone` or use local RAG.")
+            if not self.pinecone_key or not self.pinecone_index_name:
+                raise RuntimeError("PINECONE_API_KEY and PINECONE_INDEX_NAME are required for Pinecone mode.")
+            pc = Pinecone(api_key=self.pinecone_key)
+            self.index = pc.Index(self.pinecone_index_name)
 
         # runtime state
         self.conv_history: List[Dict[str, str]] = []
@@ -380,6 +447,7 @@ class Head_Agent:
             self.client,
             self.embeddings_model,
             namespace=self.pinecone_namespace,
+            local_store=self.local_store,
         )
         self.rel_agent = Relevant_Documents_Agent(self.client)
         self.answer_agent = Answering_Agent(self.client)
@@ -433,11 +501,12 @@ class Head_Agent:
         if action == "NO_SEARCH":
             # In this assignment, NO_SEARCH likely corresponds to greetings/small talk
             self._log_step("Answering_Agent")
-            ans = self.answer_agent.generate_response(rewritten, [], self.conv_history, k=0)
+            ans = "Hi! I can help answer questions about the machine-learning textbook."
             return ans, list(self.agent_path)
 
         self._log_step("Query_Agent(search)")
-        docs = self.query_agent.query_vector_store(q_for_search, k=5)
+        docs = self.query_agent.query_vector_store(q_for_search, k=self.retrieval_k)
+        self.last_docs = docs
 
         # 4) relevance judge
         self._log_step("Relevant_Documents_Agent")
@@ -447,7 +516,7 @@ class Head_Agent:
 
         # 5) answer
         self._log_step("Answering_Agent")
-        ans = self.answer_agent.generate_response(rewritten, docs, self.conv_history, k=5)
+        ans = self.answer_agent.generate_response(rewritten, docs, self.conv_history, k=self.retrieval_k)
         return ans, list(self.agent_path)
 
     def main_loop(self):
@@ -477,13 +546,23 @@ def main():
     pinecone_key = os.environ.get("PINECONE_API_KEY", "")
     pinecone_index_name = os.environ.get("PINECONE_INDEX_NAME", "")
     pinecone_namespace = os.environ.get("PINECONE_NAMESPACE", "ns-2500")
+    vector_store_path = os.environ.get("LOCAL_VECTOR_STORE_PATH", str(DEFAULT_STORE_PATH))
+    backend = os.environ.get("RAG_BACKEND", "auto").lower()
+    use_local_rag = None if backend == "auto" else backend != "pinecone"
 
-    if not openai_key or not pinecone_key or not pinecone_index_name:
+    if not openai_key:
         raise RuntimeError(
-            "Please set env vars: OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME"
+            "Please set OPENAI_API_KEY. For Pinecone mode also set PINECONE_API_KEY and PINECONE_INDEX_NAME."
         )
 
-    bot = Head_Agent(openai_key, pinecone_key, pinecone_index_name, pinecone_namespace=pinecone_namespace)
+    bot = Head_Agent(
+        openai_key,
+        pinecone_key,
+        pinecone_index_name,
+        pinecone_namespace=pinecone_namespace,
+        vector_store_path=vector_store_path,
+        use_local_rag=use_local_rag,
+    )
     bot.main_loop()
 
 
